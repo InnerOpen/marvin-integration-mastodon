@@ -1,4 +1,5 @@
-"""Mastodon provider: post a status (text, a link, up to a few images with alt text) through ``social.post``.
+"""Mastodon provider: post a status (text, a link, up to a few images with alt text) through ``social.post``, and take
+part in the conversation around it through the shared social engagement capabilities.
 
 Marvin's shared ``social.post`` capability gives every connected network one argument shape; ``post_status`` maps it
 onto Mastodon's REST API: the instance's limits are read from ``GET /api/v2/instance``, each image is downloaded and
@@ -8,6 +9,11 @@ status goes out with ``POST /api/v1/statuses`` under an ``Idempotency-Key`` so a
 The provider is pure with respect to Marvin: it gets ``config``, the resolved ``secret`` (the access token), a ``logger``
 and a safe ``http`` client via ``ctx`` and returns dicts. It never touches the database; whether a post may go out is
 Marvin's approval step, not the provider's business (the action just declares ``requires_approval``).
+
+Engagement (0.2): ``social.comments`` reads mention notifications (``GET /api/v1/notifications``) as normalised comments;
+``social.reply`` answers one with a direct or public status; ``social.like`` favourites, ``social.repost`` boosts,
+``social.message`` sends a direct status and ``social.delete_comment`` deletes one of the account's own statuses.
+Mastodon can't hide other people's replies, so there is no ``social.hide``.
 """
 
 from __future__ import annotations
@@ -38,10 +44,16 @@ from marvin_integration_sdk import (
 )
 
 from .multipart import encode_multipart
-from .text import URL_PLACEHOLDER, count_characters
+from .text import URL_PLACEHOLDER, count_characters, html_to_text
 
 NETWORK = "mastodon"
 CAPABILITY = "social.post"
+CAP_COMMENTS = "social.comments"
+CAP_REPLY = "social.reply"
+CAP_LIKE = "social.like"
+CAP_REPOST = "social.repost"
+CAP_MESSAGE = "social.message"
+CAP_DELETE_COMMENT = "social.delete_comment"
 
 # Mastodon's own defaults, used when the instance doesn't say (or, on a dry run, can't be reached).
 DEFAULT_MAX_CHARACTERS = 500
@@ -53,6 +65,17 @@ VISIBILITIES = ("public", "unlisted", "private")  # "direct" is a private mentio
 DEFAULT_VISIBILITY = "public"
 _LANGUAGE = re.compile(r"^[A-Za-z]{2,3}(-[A-Za-z0-9]{2,8})*$")
 _STATUS_ID = re.compile(r"^[A-Za-z0-9_-]+$")
+_ACCOUNT_ID = _STATUS_ID
+_HANDLE = re.compile(r"^[A-Za-z0-9_.-]+(@[A-Za-z0-9.-]+)?$")  # user or user@instance, without the leading @
+
+# social.comments. Item kinds: a mention whose status replies to one of the account's own statuses is a "reply"; every other
+# mention is a "mention". Mastodon has no separate "comment" (a comment on a post is a reply), so that kind is never produced.
+KIND_COMMENT, KIND_REPLY, KIND_MENTION = "comment", "reply", "mention"
+COMMENT_KINDS = (KIND_COMMENT, KIND_REPLY, KIND_MENTION)
+DEFAULT_COMMENTS_LIMIT = 50
+MAX_COMMENTS_LIMIT = 200
+NOTIFICATION_PAGE_SIZE = 40  # Mastodon's default page; its maximum is 80 (verify)
+MAX_NOTIFICATION_PAGES = 25  # a poll that finds more than this many new mentions picks the rest up next time
 
 # A freshly uploaded video/audio is processed in the background (202); small images are ready at once on 4.0+.
 MEDIA_POLL_ATTEMPTS = 10
@@ -65,6 +88,7 @@ ERROR_TEXT_LIMIT = 300
 # alerts by itself. A retried post is safe: the status goes out under a content-derived Idempotency-Key.
 CODE_REFUSED = "refused"  # Mastodon can't take this post (over the limit, too many images, a 422): change the post
 CODE_AUTH = "auth"  # no token, or Mastodon rejected it / its scopes (401/403): fix the connection
+CODE_UNSUPPORTED = "unsupported"  # the network can't do what was asked (e.g. delete someone else's reply)
 CODE_CONFIG = "config"  # the connection's settings are unusable (no server, not https, bad visibility)
 CODE_RATE_LIMITED = "rate_limited"  # 429 (its Retry-After becomes retry_after)
 CODE_UNAVAILABLE = "unavailable"  # the server couldn't be reached, timed out or failed on its side (5xx)
@@ -127,7 +151,10 @@ def _fail(resp: Response, what: str) -> MastodonError:
         return MastodonError(f"{base}. The access token was rejected: create a new one (Preferences → Development) and update the connection.", CODE_AUTH)
     if status == 403:
         return MastodonError(
-            f"{base}. The token may lack a scope (it needs write:statuses and write:media), or the account is limited or suspended.", CODE_AUTH
+            f"{base}. The token may lack a scope (post_status needs write:statuses and write:media; reading comments needs read:notifications, "
+            "read:statuses and read:accounts; replies, messages, reposts and deletes need write:statuses; likes need write:favourites), "
+            "or the account is limited or suspended.",
+            CODE_AUTH,
         )
     if status == 429:
         return MastodonError(f"{base}. Mastodon is rate limiting this account; try again shortly.", CODE_RATE_LIMITED, retry_after=_retry_after(resp))
@@ -180,11 +207,38 @@ _POST_OUTPUT = {
 }
 
 
+_COMMENT_ITEM = {
+    "type": "object",
+    "properties": {
+        "id": {**_STR, "description": "The mention's status id: pass it to reply, like and delete_comment."},
+        "kind": {"type": "string", "enum": [KIND_REPLY, KIND_MENTION], "description": "reply: answers one of your statuses. mention: anything else."},
+        "post_id": {"type": ["string", "null"], "description": "The status this one replies to, if any."},
+        "post_url": {"type": ["string", "null"], "description": "Permalink of that status when it is yours."},
+        "author": {"type": "object", "properties": {"id": _STR, "handle": {**_STR, "description": "user or user@instance."}, "name": _STR}},
+        "text": {**_STR, "description": "The status as plain text."},
+        "created_at": {**_STR, "description": "ISO 8601, UTC."},
+        "url": {"type": ["string", "null"]},
+        "network": {"type": "string", "const": NETWORK},
+    },
+}
+_COMMENTS_OUTPUT = {
+    "type": "object",
+    "properties": {
+        "items": {"type": "array", "items": _COMMENT_ITEM, "description": "Oldest first."},
+        "cursor": {**_STR, "description": "Pass as 'since' next time."},
+    },
+    "required": ["items", "cursor"],
+}
+
+
 @register_provider
 class MastodonProvider(IntegrationProvider):
     slug = "mastodon"
     name = "Mastodon"
-    description = "Post a status to your Mastodon account — text, a link and up to four images with alt text — after someone approves it."
+    description = (
+        "Post to your Mastodon account (text, a link, up to four images with alt text), read mentions and replies, "
+        "and reply, favourite, boost, message or delete your own replies — posting and sending after someone approves it."
+    )
     category = CATEGORY_DESTINATION
     icon = "🐘"
     logo = "logo.svg"
@@ -250,7 +304,10 @@ class MastodonProvider(IntegrationProvider):
         CredentialField(
             key="access_token",
             label="Access token",
-            help="Your access token from Preferences → Development → New application, with the write:statuses and write:media scopes.",
+            help=(
+                "Your access token from Preferences → Development → New application. Posting needs write:statuses and write:media; "
+                "reading and answering mentions also needs read:notifications, read:statuses, read:accounts and write:favourites."
+            ),
         ),
     )
     config_schema: ClassVar[dict] = {
@@ -319,6 +376,153 @@ class MastodonProvider(IntegrationProvider):
             cost_hint="free",
             requires_approval=True,
         ),
+        ProviderAction(
+            key="comments",
+            label="Read mentions and replies",
+            description=(
+                "Read the mentions of your account (Mastodon has no separate comments: a reply to one of your statuses arrives as a mention) as "
+                "normalised items, oldest first. A mention that replies to one of your own statuses is kind 'reply'; any other is 'mention'. "
+                "Pass back the cursor from the last call as 'since' to get only what is new."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "since": {**_STR, "description": "The cursor this action returned last time (opaque). Omit it on a first run: you get the newest items."},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": MAX_COMMENTS_LIMIT, "default": DEFAULT_COMMENTS_LIMIT},
+                    "kinds": {"type": "array", "items": {"type": "string", "enum": list(COMMENT_KINDS)}, "description": "Only these kinds (default: all)."},
+                },
+                "additionalProperties": False,
+            },
+            capability=CAP_COMMENTS,
+            output_schema=_COMMENTS_OUTPUT,
+            cost_hint="free",
+        ),
+        ProviderAction(
+            key="reply",
+            label="Reply to a mention",
+            description=(
+                "Reply to a mention or reply with a status that mentions its author. Private (the default) is a direct status only they see; "
+                "private=false posts a public reply in the thread. A dry run reports what would go out without posting."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "comment_id": {**_STR, "description": "The id of the item to answer (an item's id from comments)."},
+                    "text": {**_STR, "description": "The reply. The author's @handle is put in front unless it is already in the text."},
+                    "private": {"type": "boolean", "default": True},
+                    "dry_run": {"type": "boolean", "default": False},
+                },
+                "required": ["comment_id", "text"],
+                "additionalProperties": False,
+            },
+            capability=CAP_REPLY,
+            output_schema={
+                "type": "object",
+                "properties": {
+                    "replied": {"type": "boolean"},
+                    "reply_id": {"type": ["string", "null"]},
+                    "private": {"type": "boolean"},
+                    "url": {"type": ["string", "null"]},
+                    "network": {"type": "string", "const": NETWORK},
+                    "would_reply": {"type": "object", "description": "On a dry run: the text and visibility that would go out."},
+                },
+                "required": ["replied", "network"],
+            },
+            cost_hint="free",
+            requires_approval=True,
+        ),
+        ProviderAction(
+            key="like",
+            label="Favourite a mention or reply",
+            description="Favourite (like) a status by id. Easily undone, so it needs no approval.",
+            input_schema={
+                "type": "object",
+                "properties": {"comment_id": {**_STR, "description": "The status id."}},
+                "required": ["comment_id"],
+                "additionalProperties": False,
+            },
+            capability=CAP_LIKE,
+            output_schema={"type": "object", "properties": {"liked": {"type": "boolean"}, "network": {"type": "string", "const": NETWORK}}},
+            cost_hint="free",
+        ),
+        ProviderAction(
+            key="repost",
+            label="Boost a status",
+            description="Boost (repost) a status by id to your followers. Public, so a person approves it first.",
+            input_schema={
+                "type": "object",
+                "properties": {"post_id": {**_STR, "description": "The status id to boost."}},
+                "required": ["post_id"],
+                "additionalProperties": False,
+            },
+            capability=CAP_REPOST,
+            output_schema={
+                "type": "object",
+                "properties": {
+                    "reposted": {"type": "boolean"},
+                    "url": {"type": ["string", "null"], "description": "The boosted post's permalink."},
+                    "network": {"type": "string", "const": NETWORK},
+                },
+            },
+            cost_hint="free",
+            requires_approval=True,
+        ),
+        ProviderAction(
+            key="message",
+            label="Send a direct message",
+            description=(
+                "Send a direct status (visible only to the person mentioned) to an account given by handle or id. "
+                "A dry run reports what would go out without sending."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "to": {
+                        "type": "object",
+                        "properties": {
+                            "id": {**_STR, "description": "The account id (its handle is looked up)."},
+                            "handle": {**_STR, "description": "user or user@instance, with or without the leading @."},
+                        },
+                        "additionalProperties": False,
+                    },
+                    "text": {**_STR, "description": "The message. The @handle is put in front unless it is already in the text."},
+                    "dry_run": {"type": "boolean", "default": False},
+                },
+                "required": ["to", "text"],
+                "additionalProperties": False,
+            },
+            capability=CAP_MESSAGE,
+            output_schema={
+                "type": "object",
+                "properties": {
+                    "sent": {"type": "boolean"},
+                    "message_id": {"type": ["string", "null"]},
+                    "network": {"type": "string", "const": NETWORK},
+                    "would_send": {"type": "object", "description": "On a dry run: the text and recipient that would go out."},
+                },
+                "required": ["sent", "network"],
+            },
+            cost_hint="free",
+            requires_approval=True,
+        ),
+        ProviderAction(
+            key="delete_comment",
+            label="Delete one of your replies",
+            description=(
+                "Delete one of your own statuses (such as a reply) by id. Mastodon can't delete other people's replies: that is refused "
+                "with code 'unsupported'. Not undoable, so a person approves it first."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {"comment_id": {**_STR, "description": "The id of your own status."}},
+                "required": ["comment_id"],
+                "additionalProperties": False,
+            },
+            capability=CAP_DELETE_COMMENT,
+            output_schema={"type": "object", "properties": {"deleted": {"type": "boolean"}, "network": {"type": "string", "const": NETWORK}}},
+            cost_hint="free",
+            requires_approval=True,
+        ),
     )
 
     # ---- plumbing ---------------------------------------------------------------------------
@@ -371,12 +575,12 @@ class MastodonProvider(IntegrationProvider):
         return resp
 
     @staticmethod
-    def _json(resp: Response, what: str) -> dict:
+    def _json(resp: Response, what: str, expect: type = dict):
         try:
             data = resp.json()
         except ValueError as e:
             raise MastodonError(f"Mastodon {what} returned something that isn't JSON: {resp.text[:100]!r}", CODE_UNKNOWN) from e
-        if not isinstance(data, dict):
+        if not isinstance(data, expect):
             raise MastodonError(f"Mastodon {what} returned an unexpected body.", CODE_UNKNOWN)
         return data
 
@@ -396,7 +600,16 @@ class MastodonProvider(IntegrationProvider):
         return ("ok", None) if resp.status_code in (200, 403) else ("error", f"HTTP {resp.status_code}")
 
     def run_action(self, key: str, args: dict, ctx: IntegrationContext) -> dict:
-        handler = {"post_status": self._action_post_status, "delete_status": self._action_delete_status}.get(key)
+        handler = {
+            "post_status": self._action_post_status,
+            "delete_status": self._action_delete_status,
+            "comments": self._action_comments,
+            "reply": self._action_reply,
+            "like": self._action_like,
+            "repost": self._action_repost,
+            "message": self._action_message,
+            "delete_comment": self._action_delete_comment,
+        }.get(key)
         if handler is None:
             raise NotImplementedError(f"mastodon has no action '{key}'")
         self._require_secret(ctx)
@@ -429,6 +642,41 @@ class MastodonProvider(IntegrationProvider):
             "source": source,
         }
 
+    def _create_status(
+        self,
+        ctx: IntegrationContext,
+        text: str,
+        visibility: str,
+        language: str | None,
+        *,
+        media_ids: list[str] | None = None,
+        key_media: list | None = None,
+        in_reply_to: str | None = None,
+        what: str,
+    ) -> dict:
+        """``POST /api/v1/statuses`` under an Idempotency-Key made from the content, so a retry returns the first status."""
+        form: list[tuple[str, str]] = [("status", text), ("visibility", visibility)]
+        form += [("media_ids[]", mid) for mid in media_ids or []]
+        if language:
+            form.append(("language", language))
+        fields = {"status": text, "visibility": visibility, "language": language}
+        if in_reply_to:
+            form.append(("in_reply_to_id", in_reply_to))
+            fields["in_reply_to_id"] = in_reply_to
+        key = self._idempotency_key(ctx, self._server(ctx), fields, key_media or [])
+        resp = self._request(
+            ctx,
+            "post",
+            "/api/v1/statuses",
+            what=what,
+            headers={"Content-Type": "application/x-www-form-urlencoded", "Idempotency-Key": key},
+            data=urlencode(form).encode(),
+        )
+        status = self._json(resp, what)
+        if not status.get("id"):
+            raise MastodonError(f"Mastodon accepted the {what} but returned no status id.", CODE_UNKNOWN)
+        return status
+
     # ---- post_status ----------------------------------------------------------------------------
 
     @staticmethod
@@ -459,20 +707,30 @@ class MastodonProvider(IntegrationProvider):
             raise MastodonError(f"'link' must be an http(s) URL (got {link!r}).", CODE_REFUSED)
         return {"text": text.strip(), "images": images, "alts": alts, "link": link, "dry_run": _flag(args.get("dry_run", False))}
 
+    @staticmethod
+    def _check_length(text: str, limits: dict, server: str, *, hint: str, appended: bool = False) -> None:
+        """Refuse a status the instance would answer with a 422: the message says how it was counted and how to fix it."""
+        used, limit = count_characters(text, limits["url_length"]), limits["max_characters"]
+        if used > limit:
+            raise MastodonError(
+                f"The post is {used} characters but {server} allows {limit} (a URL counts as {limits['url_length']}"
+                f"{', and the link was appended' if appended else ''}). {hint}",
+                CODE_REFUSED,
+            )
+
     def _compose(self, post: dict, limits: dict, server: str) -> str:
         """The status text with the link appended on a new line (Mastodon builds its own preview card), checked against the
         instance's limits. Mastodon can't take what is refused here: the message says so and how to fix it."""
         text, link = post["text"], post["link"]
         if link and link not in text:
             text = f"{text}\n{link}"
-        used, limit = count_characters(text, limits["url_length"]), limits["max_characters"]
-        if used > limit:
-            raise MastodonError(
-                f"The post is {used} characters but {server} allows {limit} (a URL counts as {limits['url_length']}"
-                f"{', and the link was appended' if link and link not in post['text'] else ''}). "
-                'Give Mastodon a shorter text with per_network, e.g. {"mastodon": {"text": "…"}}.',
-                CODE_REFUSED,
-            )
+        self._check_length(
+            text,
+            limits,
+            server,
+            appended=bool(link and link not in post["text"]),
+            hint='Give Mastodon a shorter text with per_network, e.g. {"mastodon": {"text": "…"}}.',
+        )
         if len(post["images"]) > limits["max_media"]:
             raise MastodonError(
                 f"Mastodon on {server} takes at most {limits['max_media']} images per post ({len(post['images'])} given). "
@@ -570,22 +828,7 @@ class MastodonProvider(IntegrationProvider):
             }
 
         media_ids = [self._upload_image(ctx, url, alt, limits["image_size_limit"]) for url, alt in media]
-        form: list[tuple[str, str]] = [("status", text), ("visibility", visibility)]
-        form += [("media_ids[]", mid) for mid in media_ids]
-        if language:
-            form.append(("language", language))
-        key = self._idempotency_key(ctx, server, {"status": text, "visibility": visibility, "language": language}, media)
-        resp = self._request(
-            ctx,
-            "post",
-            "/api/v1/statuses",
-            what="post",
-            headers={"Content-Type": "application/x-www-form-urlencoded", "Idempotency-Key": key},
-            data=urlencode(form).encode(),
-        )
-        status = self._json(resp, "post")
-        if not status.get("id"):
-            raise MastodonError("Mastodon accepted the post but returned no status id.", CODE_UNKNOWN)
+        status = self._create_status(ctx, text, visibility, language, media_ids=media_ids, key_media=media, what="post")
         return {
             "posted": True,
             "dry_run": False,
@@ -604,3 +847,253 @@ class MastodonProvider(IntegrationProvider):
             raise MastodonError("delete_status needs 'id', the status id a post returned as post_id.", CODE_REFUSED)
         self._request(ctx, "delete", f"/api/v1/statuses/{status_id}", what="delete")
         return {"deleted": True, "id": status_id, "network": NETWORK}
+
+    # ---- engagement: shared helpers -------------------------------------------------------------------
+
+    def _get(self, ctx: IntegrationContext, path: str, what: str, expect: type = dict):
+        return self._json(self._request(ctx, "get", path, what=what), what, expect)
+
+    @staticmethod
+    def _id_arg(args: dict, name: str, action: str) -> str:
+        value = str(args.get(name) or "").strip()
+        if not _STATUS_ID.match(value):
+            raise MastodonError(f"{action} needs '{name}', a Mastodon status id.", CODE_REFUSED)
+        return value
+
+    @staticmethod
+    def _text_arg(args: dict, action: str) -> str:
+        text = args.get("text")
+        if not isinstance(text, str) or not text.strip():
+            raise MastodonError(f"{action} needs 'text' (a non-empty string).", CODE_REFUSED)
+        return text.strip()
+
+    def _me(self, ctx: IntegrationContext) -> dict:
+        """The connected account (``verify_credentials``, which needs read:accounts): its id tells our own statuses from others'."""
+        me = self._get(ctx, "/api/v1/accounts/verify_credentials", "account lookup")
+        if not me.get("id"):
+            raise MastodonError("Mastodon returned no account id for this token.", CODE_UNKNOWN)
+        return me
+
+    def _status(self, ctx: IntegrationContext, status_id: str) -> dict:
+        return self._get(ctx, f"/api/v1/statuses/{quote(status_id, safe='')}", "status lookup")
+
+    @staticmethod
+    def _with_mention(text: str, acct: str) -> str:
+        """``text`` with ``@acct`` in front unless it already mentions that account (a local ``@user`` is not ``@user@elsewhere``)."""
+        if re.search(rf"(?<![\w@])@{re.escape(acct)}(?![\w@-])", text, re.IGNORECASE):
+            return text
+        return f"@{acct} {text}"
+
+    # ---- comments (social.comments) ---------------------------------------------------------------------------
+
+    @staticmethod
+    def _parse_comments(args: dict) -> tuple[str | None, int, tuple[str, ...]]:
+        since = args.get("since")
+        if since is not None and (not isinstance(since, str) or (since and not _STATUS_ID.match(since))):
+            raise MastodonError("'since' must be the cursor this plugin returned last time.", CODE_REFUSED)
+        raw = args.get("limit")
+        try:
+            limit = DEFAULT_COMMENTS_LIMIT if raw is None else int(raw)
+        except (TypeError, ValueError):
+            limit = 0
+        if not 1 <= limit <= MAX_COMMENTS_LIMIT:
+            raise MastodonError(f"'limit' must be a whole number from 1 to {MAX_COMMENTS_LIMIT} (default {DEFAULT_COMMENTS_LIMIT}).", CODE_REFUSED)
+        kinds = args.get("kinds")
+        if kinds is None:
+            kinds = COMMENT_KINDS
+        if not isinstance(kinds, (list, tuple)) or any(k not in COMMENT_KINDS for k in kinds):
+            raise MastodonError(f"'kinds' must be a list drawn from {', '.join(COMMENT_KINDS)}.", CODE_REFUSED)
+        return since or None, limit, tuple(kinds)
+
+    @staticmethod
+    def _id_key(value) -> tuple[int, str]:
+        text = str(value)
+        return (int(text), text) if text.isdigit() else (-1, text)
+
+    def _fetch_mentions(self, ctx: IntegrationContext, since: str | None, limit: int) -> list[dict]:
+        """Mention notifications newer than ``since``, newest first within each page: ``GET /api/v1/notifications`` pages back
+        with ``max_id`` until an empty page. Without a cursor it stops once ``limit`` are in hand (the newest ones; a first run
+        should not replay a whole history)."""
+        found: dict[str, dict] = {}
+        max_id: str | None = None
+        for _ in range(MAX_NOTIFICATION_PAGES):
+            params = [("types[]", "mention"), ("limit", str(NOTIFICATION_PAGE_SIZE))]
+            if since:
+                params.append(("since_id", since))
+            if max_id:
+                params.append(("max_id", max_id))
+            page = self._get(ctx, f"/api/v1/notifications?{urlencode(params)}", "notifications", list)
+            page = [n for n in page if isinstance(n, dict) and n.get("id") is not None]
+            if not page:
+                break
+            for note in page:
+                found[str(note["id"])] = note
+            oldest = min((str(n["id"]) for n in page), key=self._id_key)
+            if oldest == max_id:  # the server ignored max_id: don't loop forever
+                break
+            max_id = oldest
+            if not since and len(found) >= limit:
+                break
+        else:
+            ctx.logger.warning("mastodon: more than %d new mentions; the rest are picked up on the next poll", MAX_NOTIFICATION_PAGES * NOTIFICATION_PAGE_SIZE)
+        return sorted(found.values(), key=lambda n: self._id_key(n["id"]))
+
+    @staticmethod
+    def _iso_utc(value) -> str | None:
+        try:
+            when = datetime.fromisoformat(str(value))
+        except ValueError:
+            return str(value) if value else None
+        return (when if when.tzinfo else when.replace(tzinfo=UTC)).astimezone(UTC).isoformat()
+
+    def _comment(self, note: dict, me: dict, server: str) -> dict | None:
+        """One mention notification as a social.comments item (None when its status is gone)."""
+        status = note.get("status")
+        if not isinstance(status, dict) or not status.get("id"):
+            return None
+        author = status.get("account") or note.get("account") or {}
+        parent = str(status["in_reply_to_id"]) if status.get("in_reply_to_id") else None
+        to_us = parent is not None and str(status.get("in_reply_to_account_id") or "") == str(me["id"])
+        # The permalink of one of our own (local) statuses is {server}/@{username}/{id} (verify); a parent that is someone else's has no known URL.
+        post_url = f"{server}/@{me.get('username') or me.get('acct')}/{parent}" if to_us else None
+        return {
+            "id": str(status["id"]),
+            "kind": KIND_REPLY if to_us else KIND_MENTION,
+            "post_id": parent,
+            "post_url": post_url,
+            "author": {
+                "id": str(author.get("id") or ""),
+                "handle": author.get("acct") or author.get("username") or "",
+                "name": author.get("display_name") or author.get("username") or author.get("acct") or "",
+            },
+            "text": html_to_text(status.get("content")),
+            "created_at": self._iso_utc(status.get("created_at") or note.get("created_at")),
+            "url": status.get("url") or status.get("uri"),
+            "network": NETWORK,
+        }
+
+    def _action_comments(self, args: dict, ctx: IntegrationContext) -> dict:
+        since, limit, kinds = self._parse_comments(args)
+        notes = self._fetch_mentions(ctx, since, limit)
+        if not notes:
+            return {"items": [], "cursor": since or ""}
+        server, me = self._server(ctx), self._me(ctx)
+        entries = [(str(n["id"]), self._comment(n, me, server)) for n in notes]
+        entries = [(nid, item) for nid, item in entries if item and item["kind"] in kinds]
+        newest = str(notes[-1]["id"])
+        if since is None:  # no cursor: the newest ``limit``, oldest first
+            kept = entries[-limit:]
+            cursor = newest
+        elif len(entries) > limit:  # more waiting: stop after the last one handed over, the next poll starts there
+            kept = entries[:limit]
+            cursor = kept[-1][0]
+        else:
+            kept, cursor = entries, newest
+        return {"items": [item for _, item in kept], "cursor": cursor}
+
+    # ---- reply (social.reply) -------------------------------------------------------------------------------
+
+    def _action_reply(self, args: dict, ctx: IntegrationContext) -> dict:
+        comment_id = self._id_arg(args, "comment_id", "reply")
+        text = self._text_arg(args, "reply")
+        private = True if args.get("private") is None else _flag(args["private"])
+        dry_run = _flag(args.get("dry_run", False))
+        server, configured, language = self._server(ctx), self._visibility(ctx), self._language(ctx)
+        limits = self._limits(ctx, tolerate_failure=dry_run)
+        acct = str((self._status(ctx, comment_id).get("account") or {}).get("acct") or "")
+        if not acct:
+            raise MastodonError(f"Mastodon returned no author for status {comment_id}, so the reply can't mention them.", CODE_UNKNOWN)
+        # A private reply is a direct status (only the people it mentions see it); a public one is public, or unlisted if the
+        # connection is set to unlisted. Followers-only ("private" in the connection) is not a reply mode here.
+        visibility = "direct" if private else ("unlisted" if configured == "unlisted" else "public")
+        text = self._with_mention(text, acct)
+        self._check_length(text, limits, server, hint="Shorten the reply.")
+        if dry_run:
+            return {
+                "replied": False,
+                "dry_run": True,
+                "reply_id": None,
+                "private": private,
+                "url": None,
+                "network": NETWORK,
+                "would_reply": {
+                    "server": server,
+                    "in_reply_to_id": comment_id,
+                    "to": acct,
+                    "text": text,
+                    "characters": count_characters(text, limits["url_length"]),
+                    "limit": limits["max_characters"],
+                    "limits_from": limits["source"],
+                    "visibility": visibility,
+                    "language": language,
+                },
+            }
+        status = self._create_status(ctx, text, visibility, language, in_reply_to=comment_id, what="reply")
+        return {"replied": True, "dry_run": False, "reply_id": str(status["id"]), "private": private, "url": status.get("url"), "network": NETWORK}
+
+    # ---- like / repost (social.like, social.repost) --------------------------------------------------------------
+
+    def _action_like(self, args: dict, ctx: IntegrationContext) -> dict:
+        comment_id = self._id_arg(args, "comment_id", "like")
+        self._request(ctx, "post", f"/api/v1/statuses/{comment_id}/favourite", what="like")
+        return {"liked": True, "network": NETWORK}
+
+    def _action_repost(self, args: dict, ctx: IntegrationContext) -> dict:
+        post_id = self._id_arg(args, "post_id", "repost")
+        resp = self._request(ctx, "post", f"/api/v1/statuses/{post_id}/reblog", what="repost")
+        status = self._json(resp, "repost")
+        # The response is the new boost wrapping the original in "reblog"; the boosted post's permalink is the useful one (verify).
+        url = (status.get("reblog") or {}).get("url") or status.get("url")
+        return {"reposted": True, "url": url, "network": NETWORK}
+
+    # ---- message (social.message) ------------------------------------------------------------------------------
+
+    def _action_message(self, args: dict, ctx: IntegrationContext) -> dict:
+        to = args.get("to")
+        if not isinstance(to, dict):
+            raise MastodonError("message needs 'to': {id} or {handle}.", CODE_REFUSED)
+        text = self._text_arg(args, "message")
+        dry_run = _flag(args.get("dry_run", False))
+        handle = str(to.get("handle") or "").strip().removeprefix("@")
+        account_id = str(to.get("id") or "").strip()
+        if handle and not _HANDLE.match(handle):
+            raise MastodonError(f"'to.handle' must look like user or user@instance (got {handle!r}).", CODE_REFUSED)
+        if not handle:
+            if not _ACCOUNT_ID.match(account_id):
+                raise MastodonError("message needs 'to.handle' or 'to.id' (a Mastodon account id).", CODE_REFUSED)
+            handle = str(self._get(ctx, f"/api/v1/accounts/{account_id}", "account lookup").get("acct") or "")
+            if not handle:
+                raise MastodonError(f"Mastodon returned no handle for account {account_id}.", CODE_UNKNOWN)
+        server, language = self._server(ctx), self._language(ctx)
+        limits = self._limits(ctx, tolerate_failure=dry_run)
+        text = self._with_mention(text, handle)
+        self._check_length(text, limits, server, hint="Shorten the message.")
+        if dry_run:
+            return {
+                "sent": False,
+                "dry_run": True,
+                "message_id": None,
+                "network": NETWORK,
+                "would_send": {
+                    "server": server,
+                    "to": handle,
+                    "text": text,
+                    "characters": count_characters(text, limits["url_length"]),
+                    "limit": limits["max_characters"],
+                    "limits_from": limits["source"],
+                    "visibility": "direct",
+                    "language": language,
+                },
+            }
+        status = self._create_status(ctx, text, "direct", language, what="message")
+        return {"sent": True, "dry_run": False, "message_id": str(status["id"]), "network": NETWORK}
+
+    # ---- delete_comment (social.delete_comment) ----------------------------------------------------------------
+
+    def _action_delete_comment(self, args: dict, ctx: IntegrationContext) -> dict:
+        comment_id = self._id_arg(args, "comment_id", "delete_comment")
+        author = str((self._status(ctx, comment_id).get("account") or {}).get("id") or "")
+        if not author or author != str(self._me(ctx)["id"]):
+            raise MastodonError("Mastodon can delete only your own replies: that status belongs to someone else.", CODE_UNSUPPORTED)
+        self._request(ctx, "delete", f"/api/v1/statuses/{comment_id}", what="delete")
+        return {"deleted": True, "network": NETWORK}

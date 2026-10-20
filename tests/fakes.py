@@ -5,7 +5,7 @@ import json
 import logging
 from dataclasses import dataclass
 from email import policy
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, urlsplit
 
 from marvin_integration_sdk import IntegrationContext, Response
 
@@ -53,13 +53,30 @@ class FakeMastodon:
     """Routes by method and path. ``images`` maps a URL to (bytes, content-type); ``polls`` is the list of status codes the
     media endpoint answers in turn (the last repeats); ``upload_status`` is what POST /api/v2/media answers (200 or 202)."""
 
-    def __init__(self, *, instance=INSTANCE, instance_status=200, images=None, upload_status=200, polls=(200,), poll_status_body=None, status_reply=None, raises=None):
+    def __init__(
+        self,
+        *,
+        instance=INSTANCE,
+        instance_status=200,
+        images=None,
+        upload_status=200,
+        polls=(200,),
+        poll_status_body=None,
+        status_reply=None,
+        raises=None,
+        notifications=(),
+        statuses=None,
+        accounts=None,
+    ):
         self.instance, self.instance_status = instance, instance_status
         self.images = images if images is not None else {}
         self.upload_status, self.polls = upload_status, list(polls)
         self.status_reply = status_reply
         self.raises = raises or {}  # "METHOD path-prefix" -> exception to raise
-        self.verify = reply(200, {"id": "1", "acct": "me"})
+        self.verify = reply(200, {"id": "1", "acct": "me", "username": "me"})
+        self.notifications = list(notifications)  # every mention notification the instance has, any order
+        self.statuses = statuses if statuses is not None else {}  # id -> status
+        self.accounts = accounts if accounts is not None else {}  # id -> account
         self.requests: list[Request] = []
         self._media = 0
 
@@ -94,13 +111,34 @@ class FakeMastodon:
             return reply(self.instance_status, self.instance)
         if req.path == "/api/v1/accounts/verify_credentials":
             return self.verify
+        if req.path.startswith("/api/v1/notifications"):
+            return reply(200, self._notifications(parse_qs(urlsplit(url).query)))
+        if req.path.startswith("/api/v1/statuses/") and req.path.rsplit("/", 1)[-1] in self.statuses:
+            return reply(200, self.statuses[req.path.rsplit("/", 1)[-1]])
+        if req.path.startswith("/api/v1/accounts/") and req.path.rsplit("/", 1)[-1] in self.accounts:
+            return reply(200, self.accounts[req.path.rsplit("/", 1)[-1]])
         if req.path.startswith("/api/v1/media/"):
             code = self.polls.pop(0) if len(self.polls) > 1 else self.polls[0]
             return reply(code, {"id": req.path.rsplit("/", 1)[-1]})
         return reply(404, {"error": "Record not found"})
 
+    def _notifications(self, query) -> list[dict]:
+        """What Mastodon answers: newest first, only the asked types, after since_id and before max_id, at most ``limit``."""
+        assert query.get("types[]") == ["mention"]
+        found = [n for n in self.notifications if n["type"] in query["types[]"]]
+        if "since_id" in query:
+            found = [n for n in found if int(n["id"]) > int(query["since_id"][0])]
+        if "max_id" in query:
+            found = [n for n in found if int(n["id"]) < int(query["max_id"][0])]
+        return sorted(found, key=lambda n: -int(n["id"]))[: int(query.get("limit", ["40"])[0])]
+
     def post(self, url, *, json=None, data=None, headers=None, timeout=15):
         req = self._record("POST", url, headers, data, timeout)
+        if req.path.endswith("/favourite"):
+            return reply(200, {"id": req.path.split("/")[-2], "favourited": True})
+        if req.path.endswith("/reblog"):
+            original = req.path.split("/")[-2]
+            return reply(200, {"id": "900", "url": None, "reblog": {"id": original, "url": f"{SERVER}/@them/{original}"}})
         if req.path == "/api/v2/media":
             self._media += 1
             return reply(self.upload_status, {"id": f"m{self._media}", "url": None if self.upload_status == 202 else "https://files.example/x"})

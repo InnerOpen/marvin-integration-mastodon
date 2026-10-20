@@ -1,7 +1,7 @@
 [project]
 name = "marvin-integration-mastodon"
-version = "0.1.0"
-description = "Mastodon integration for Marvin — post a status (text, link, up to 4 images with alt text) through the shared social.post capability."
+version = "0.2.0"
+description = "Mastodon integration for Marvin — post a status through social.post, and read mentions and reply, favourite, boost, message or delete your own replies through the shared social engagement capabilities."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = ["marvin-integration-sdk>=0.9,<1"]
