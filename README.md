@@ -12,7 +12,9 @@ An installed Marvin finds it through the `marvin.integrations` entry point: no c
 
 1. **Create an access token on your instance.** Preferences → Development → **New application**. Name it (for
    example "Marvin"), and tick the scopes below. Untick the defaults (`read`, `write`, `follow`, `push`) and
-   grant only what you use. Save, open the application and copy **Your access token**.
+   grant only what you use. Leave **Redirect URI** as it is (`urn:ietf:wg:oauth:2.0:oob`; paste that if the field is
+   empty): Marvin uses the token shown after saving, not a sign-in redirect. Save, open the application and copy
+   **Your access token**.
 
    | Scope | Needed for |
    |---|---|

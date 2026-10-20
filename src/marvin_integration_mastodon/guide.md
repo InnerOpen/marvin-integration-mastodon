@@ -7,7 +7,8 @@ schedule, post polls or hide other people's replies.
 
 ## Connect it
 
-1. On your instance: **Preferences → Development → New application**. Give it the scopes you need, and no others:
+1. On your instance: **Preferences → Development → New application**. Leave **Redirect URI** as
+   `urn:ietf:wg:oauth:2.0:oob` (Marvin uses the token, not a redirect). Give it the scopes you need, and no others:
    `write:statuses` and `write:media` to post; `read:notifications`, `read:statuses` and `read:accounts` to read and answer
    mentions; `write:favourites` to like. With `read:accounts` the connection check reads your profile (without it, a 403 is
    still treated as a working token). Copy **Your access token**.
