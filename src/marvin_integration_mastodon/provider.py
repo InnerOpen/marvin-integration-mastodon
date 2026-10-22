@@ -293,13 +293,13 @@ class MastodonProvider(IntegrationProvider):
                 },
                 "mastodon_integration": {
                     "type": "integration_slug",
-                    "description": "The Mastodon connection; its token needs write:statuses and write:media.",
+                    "description": "The Mastodon connection. Its token needs the `write:statuses` and `write:media` permissions.",
                     "example": "mastodon",
                 },
             },
             side_effects=(
-                {"kind": "external_post", "description": "One public Mastodon status per approved run."},
-                {"kind": "content_mutation", "description": "Sets mastodon_post_id and mastodon_url on the entry."},
+                {"kind": "external_post", "description": "One public Mastodon post per approved run."},
+                {"kind": "content_mutation", "description": "Saves the post's link on the entry."},
             ),
         ),
     )
