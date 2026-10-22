@@ -40,6 +40,7 @@ from marvin_integration_sdk import (
     Response,
     Retry,
     WorkflowRecipe,
+    playbook_blueprint,
     register_provider,
 )
 
@@ -244,6 +245,9 @@ class MastodonProvider(IntegrationProvider):
     logo = "logo.svg"
 
     guide = "guide.md"
+    # A Playbook (0.3, SDK 0.15): how to write a post for Mastodon, a skill folder in the package's data. A workspace adds it from the card
+    # as a draft Playbook, reads it and publishes it; an older Marvin skips it.
+    content = (playbook_blueprint(__package__, "playbooks/mastodon-post"),)
     recipes = (
         WorkflowRecipe(
             id="post-on-publish",

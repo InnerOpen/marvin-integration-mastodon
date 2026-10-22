@@ -72,6 +72,17 @@ Visibility and language come from the connection's settings, not from the argume
 
 `id` (the `post_id` a post returned) → `DELETE /api/v1/statuses/:id`. Output: `deleted`, `id`, `network`.
 
+## A Playbook for posts (0.3.0)
+
+The card's **Optional** content offers the Playbook `mastodon-post` (needs SDK 0.15 and a Marvin that knows Playbook
+blueprints; an older Marvin skips it): how to write a post for Mastodon. It covers the length (500 characters on most
+servers, a link counted as 23, a mention as its local part), the shape of a post, one to three CamelCase hashtags, alt text
+for images and what to do about a content warning (this connection can't set one, so the Playbook says to tell a person).
+Output is the post text, for an Approval step and then `post_status`; the agent writes it itself (`create_draft` /
+`update_draft` when it is kept as an entry, never `compose_entry` / `revise_entry`) and never posts. It arrives as a **draft
+Playbook** for an admin to read and publish. The folder is `src/marvin_integration_mastodon/playbooks/mastodon-post/`
+(`SKILL.md` and `references/examples.md`), shipped as package data.
+
 ## Engagement (social.comments and friends)
 
 Each action declares one capability, so Marvin's shared auto-reply engine and workflows reach it the same way on every

@@ -1,10 +1,11 @@
 [project]
 name = "marvin-integration-mastodon"
-version = "0.2.0"
+version = "0.3.0"
 description = "Mastodon integration for Marvin — post a status through social.post, and read mentions and reply, favourite, boost, message or delete your own replies through the shared social engagement capabilities."
 readme = "README.md"
 requires-python = ">=3.11"
-dependencies = ["marvin-integration-sdk>=0.9,<1"]
+# 0.15: `playbook_blueprint` — the integration ships a Playbook.
+dependencies = ["marvin-integration-sdk>=0.15,<1"]
 
 [project.optional-dependencies]
 dev = ["pytest>=8", "ruff>=0.11"]
