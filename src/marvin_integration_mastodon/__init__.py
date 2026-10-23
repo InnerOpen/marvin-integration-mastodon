@@ -3,4 +3,4 @@
 from .provider import MastodonProvider
 
 __all__ = ["MastodonProvider"]
-__version__ = "0.3.1"
+__version__ = "0.4.0"

@@ -28,6 +28,8 @@ schedule, post polls or hide other people's replies.
   replies to one of your own statuses is kind `reply`, any other is `mention` (`comment` is never produced). Each item has
   `id` (the status id), `kind`, `post_id`, `post_url`, `author` (`id`, `handle`, `name`), `text` (plain text),
   `created_at`, `url` and `network`.
+  A mention on a **direct** status (only the people it mentions see it) comes back as kind `message` — a DM, which
+  Marvin's Social inbox keeps and answers only by a direct status back (`message`), never publicly.
 - `reply` (`social.reply`, needs approval): args `comment_id`, `text`, `private` (default true), `dry_run`. Private is a
   direct status only the person sees; `private: false` replies publicly. The person's `@handle` is put in front unless it
   is already in the text. Returns `replied`, `reply_id`, `private`, `url`, `network` and, on a dry run, `would_reply`.

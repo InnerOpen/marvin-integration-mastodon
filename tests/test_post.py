@@ -452,7 +452,12 @@ def test_a_retried_call_sends_the_same_key():
 
 @pytest.mark.parametrize(
     "other",
-    [{"text": "Different"}, {"text": "Same", "images": [IMG1]}, {"text": "Same", "images": [IMG1], "alt": ["alt"]}, {"text": "Same", "link": "https://e.org/x"}],
+    [
+        {"text": "Different"},
+        {"text": "Same", "images": [IMG1]},
+        {"text": "Same", "images": [IMG1], "alt": ["alt"]},
+        {"text": "Same", "link": "https://e.org/x"},
+    ],
 )
 def test_different_content_sends_a_different_key(other):
     http = FakeMastodon(images=PICS)

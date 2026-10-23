@@ -69,10 +69,12 @@ _STATUS_ID = re.compile(r"^[A-Za-z0-9_-]+$")
 _ACCOUNT_ID = _STATUS_ID
 _HANDLE = re.compile(r"^[A-Za-z0-9_.-]+(@[A-Za-z0-9.-]+)?$")  # user or user@instance, without the leading @
 
-# social.comments. Item kinds: a mention whose status replies to one of the account's own statuses is a "reply"; every other
-# mention is a "mention". Mastodon has no separate "comment" (a comment on a post is a reply), so that kind is never produced.
+# social.comments. Item kinds: a mention on a direct-visibility status is a "message" (a DM, 0.4.0); a mention whose status replies
+# to one of the account's own statuses is a "reply"; every other mention is a "mention". Mastodon has no separate "comment" (a
+# comment on a post is a reply), so that kind is never produced.
 KIND_COMMENT, KIND_REPLY, KIND_MENTION = "comment", "reply", "mention"
-COMMENT_KINDS = (KIND_COMMENT, KIND_REPLY, KIND_MENTION)
+KIND_MESSAGE = "message"  # 0.4.0: a mention on a direct-visibility status — a DM, kept apart from public mentions
+COMMENT_KINDS = (KIND_COMMENT, KIND_REPLY, KIND_MENTION, KIND_MESSAGE)
 DEFAULT_COMMENTS_LIMIT = 50
 MAX_COMMENTS_LIMIT = 200
 NOTIFICATION_PAGE_SIZE = 40  # Mastodon's default page; its maximum is 80 (verify)
@@ -149,7 +151,9 @@ def _fail(resp: Response, what: str) -> MastodonError:
     status, detail = resp.status_code, _detail(resp)
     base = f"Mastodon {what} failed: HTTP {status}: {detail}"
     if status == 401:
-        return MastodonError(f"{base}. The access token was rejected: create a new one (Preferences → Development) and update the connection.", CODE_AUTH)
+        return MastodonError(
+            f"{base}. The access token was rejected: create a new one (Preferences → Development) and update the connection.", CODE_AUTH
+        )
     if status == 403:
         return MastodonError(
             f"{base}. The token may lack a scope (post_status needs write:statuses and write:media; reading comments needs read:notifications, "
@@ -212,7 +216,11 @@ _COMMENT_ITEM = {
     "type": "object",
     "properties": {
         "id": {**_STR, "description": "The mention's status id: pass it to reply, like and delete_comment."},
-        "kind": {"type": "string", "enum": [KIND_REPLY, KIND_MENTION], "description": "reply: answers one of your statuses. mention: anything else."},
+        "kind": {
+            "type": "string",
+            "enum": [KIND_REPLY, KIND_MENTION, KIND_MESSAGE],
+            "description": "reply: answers one of your statuses. message: a direct status (a DM). mention: anything else.",
+        },
         "post_id": {"type": ["string", "null"], "description": "The status this one replies to, if any."},
         "post_url": {"type": ["string", "null"], "description": "Permalink of that status when it is yours."},
         "author": {"type": "object", "properties": {"id": _STR, "handle": {**_STR, "description": "user or user@instance."}, "name": _STR}},
@@ -344,7 +352,10 @@ class MastodonProvider(IntegrationProvider):
             input_schema={
                 "type": "object",
                 "properties": {
-                    "text": {**_STR, "description": "The status text. Counted the Mastodon way: a URL is 23 characters; the instance's limit applies."},
+                    "text": {
+                        **_STR,
+                        "description": "The status text. Counted the Mastodon way: a URL is 23 characters; the instance's limit applies.",
+                    },
                     "images": {
                         "type": "array",
                         "items": _STR,
@@ -391,9 +402,16 @@ class MastodonProvider(IntegrationProvider):
             input_schema={
                 "type": "object",
                 "properties": {
-                    "since": {**_STR, "description": "The cursor this action returned last time (opaque). Omit it on a first run: you get the newest items."},
+                    "since": {
+                        **_STR,
+                        "description": "The cursor this action returned last time (opaque). Omit it on a first run: you get the newest items.",
+                    },
                     "limit": {"type": "integer", "minimum": 1, "maximum": MAX_COMMENTS_LIMIT, "default": DEFAULT_COMMENTS_LIMIT},
-                    "kinds": {"type": "array", "items": {"type": "string", "enum": list(COMMENT_KINDS)}, "description": "Only these kinds (default: all)."},
+                    "kinds": {
+                        "type": "array",
+                        "items": {"type": "string", "enum": list(COMMENT_KINDS)},
+                        "description": "Only these kinds (default: all).",
+                    },
                 },
                 "additionalProperties": False,
             },
@@ -567,7 +585,9 @@ class MastodonProvider(IntegrationProvider):
     def _auth(ctx: IntegrationContext) -> dict[str, str]:
         return {"Authorization": f"Bearer {ctx.secret}"}
 
-    def _request(self, ctx: IntegrationContext, method: str, path: str, *, what: str, ok: tuple[int, ...] = (200,), headers=None, **kwargs) -> Response:
+    def _request(
+        self, ctx: IntegrationContext, method: str, path: str, *, what: str, ok: tuple[int, ...] = (200,), headers=None, **kwargs
+    ) -> Response:
         """One call to the instance with the token. Anything outside ``ok`` raises a MastodonError."""
         server = self._server(ctx)
         try:
@@ -744,7 +764,8 @@ class MastodonProvider(IntegrationProvider):
         too_long = [i + 1 for i, alt in enumerate(post["alts"]) if len(alt) > limits["description_limit"]]
         if too_long:
             raise MastodonError(
-                f"The alt text of image {', '.join(map(str, too_long))} is over {server}'s {limits['description_limit']}-character limit.", CODE_REFUSED
+                f"The alt text of image {', '.join(map(str, too_long))} is over {server}'s {limits['description_limit']}-character limit.",
+                CODE_REFUSED,
             )
         return text
 
@@ -756,7 +777,9 @@ class MastodonProvider(IntegrationProvider):
         except Exception as e:
             raise MastodonError(f"Could not download the image {url}: {e}", CODE_UNKNOWN) from e
         if not resp.ok:
-            raise MastodonError(f"Could not download the image {url}: HTTP {resp.status_code}.", CODE_UNAVAILABLE if resp.status_code >= 500 else CODE_UNKNOWN)
+            raise MastodonError(
+                f"Could not download the image {url}: HTTP {resp.status_code}.", CODE_UNAVAILABLE if resp.status_code >= 500 else CODE_UNKNOWN
+            )
         data = resp.content
         if not data:
             raise MastodonError(f"The image {url} is empty.", CODE_REFUSED)
@@ -788,7 +811,9 @@ class MastodonProvider(IntegrationProvider):
 
     def _upload_image(self, ctx: IntegrationContext, url: str, alt: str, size_limit: int) -> str:
         data, content_type, filename = self._fetch_image(ctx, url, size_limit)
-        body, header = encode_multipart({"description": alt} if alt else {}, file_field="file", filename=filename, content_type=content_type, data=data)
+        body, header = encode_multipart(
+            {"description": alt} if alt else {}, file_field="file", filename=filename, content_type=content_type, data=data
+        )
         resp = self._request(
             ctx, "post", "/api/v2/media", what="image upload", ok=(200, 202), headers={"Content-Type": header}, data=body, timeout=UPLOAD_TIMEOUT
         )
@@ -939,7 +964,9 @@ class MastodonProvider(IntegrationProvider):
             if not since and len(found) >= limit:
                 break
         else:
-            ctx.logger.warning("mastodon: more than %d new mentions; the rest are picked up on the next poll", MAX_NOTIFICATION_PAGES * NOTIFICATION_PAGE_SIZE)
+            ctx.logger.warning(
+                "mastodon: more than %d new mentions; the rest are picked up on the next poll", MAX_NOTIFICATION_PAGES * NOTIFICATION_PAGE_SIZE
+            )
         return sorted(found.values(), key=lambda n: self._id_key(n["id"]))
 
     @staticmethod
@@ -958,13 +985,14 @@ class MastodonProvider(IntegrationProvider):
         author = status.get("account") or note.get("account") or {}
         parent = str(status["in_reply_to_id"]) if status.get("in_reply_to_id") else None
         to_us = parent is not None and str(status.get("in_reply_to_account_id") or "") == str(me["id"])
+        direct = status.get("visibility") == "direct"  # a DM: only the people it mentions see it
         # The permalink of one of our own (local) statuses is {server}/@{username}/{id} (verify); a parent that is someone else's has no known URL.
         post_url = f"{server}/@{me.get('username') or me.get('acct')}/{parent}" if to_us else None
         return {
             "id": str(status["id"]),
-            "kind": KIND_REPLY if to_us else KIND_MENTION,
-            "post_id": parent,
-            "post_url": post_url,
+            "kind": KIND_MESSAGE if direct else KIND_REPLY if to_us else KIND_MENTION,
+            "post_id": None if direct else parent,
+            "post_url": None if direct else post_url,
             "author": {
                 "id": str(author.get("id") or ""),
                 "handle": author.get("acct") or author.get("username") or "",

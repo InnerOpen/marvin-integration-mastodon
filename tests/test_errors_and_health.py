@@ -90,7 +90,9 @@ def test_no_token_is_refused_before_any_request():
     assert caught.value.code == "auth" and http.requests == []
 
 
-@pytest.mark.parametrize("server", ["", "http://mastodon.example", "https://mastodon.example/some/path", "https://user:pw@mastodon.example", "ftp://x"])
+@pytest.mark.parametrize(
+    "server", ["", "http://mastodon.example", "https://mastodon.example/some/path", "https://user:pw@mastodon.example", "ftp://x"]
+)
 def test_an_unusable_server_is_a_config_error(server):
     http = FakeMastodon()
     with pytest.raises(MastodonError) as caught:

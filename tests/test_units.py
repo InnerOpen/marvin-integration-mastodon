@@ -54,6 +54,9 @@ def test_the_boundary_is_never_inside_the_data(monkeypatch):
     assert header.endswith("b" * 32)
 
 
-@pytest.mark.parametrize(("name", "expected"), [("hero.png", "hero.png"), ('a"b\r\n.png', "a_b_.png"), ("../../etc/passwd", "etc_passwd"), ("", "image"), ("日本語", "image")])
+@pytest.mark.parametrize(
+    ("name", "expected"),
+    [("hero.png", "hero.png"), ('a"b\r\n.png', "a_b_.png"), ("../../etc/passwd", "etc_passwd"), ("", "image"), ("日本語", "image")],
+)
 def test_safe_filename(name, expected):
     assert safe_filename(name) == expected

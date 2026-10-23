@@ -102,6 +102,19 @@ def test_kinds_filters_but_the_cursor_still_moves_past_what_was_skipped():
     assert run("comments", {"kinds": ["comment"]}, http)["items"] == []  # Mastodon has no separate comments
 
 
+def test_a_mention_on_a_direct_status_is_a_message_kept_apart_from_public_mentions():
+    dm = note(3, parent="3", parent_account="1")
+    dm["status"]["visibility"] = "direct"
+    http = FakeMastodon(notifications=[note(1), dm])
+
+    kinds = [i["kind"] for i in run("comments", {}, http)["items"]]
+    (message,) = run("comments", {"kinds": ["message"]}, http)["items"]
+
+    assert kinds == ["mention", "message"]
+    assert (message["post_id"], message["post_url"]) == (None, None)  # a DM has no post to point at
+    assert [i["kind"] for i in run("comments", {"kinds": ["comment", "reply", "mention"]}, http)["items"]] == ["mention"]
+
+
 def test_html_is_stripped_to_plain_text():
     content = (
         '<p><span class="h-card"><a href="https://mastodon.example/@me" class="u-url mention">@<span>me</span></a></span> thanks &amp; '
@@ -187,7 +200,9 @@ def test_the_default_limit_is_50():
     assert len(out["items"]) == 50 and out["cursor"] == "50"
 
 
-@pytest.mark.parametrize("args", [{"limit": 0}, {"limit": 1000}, {"limit": "many"}, {"kinds": ["spam"]}, {"kinds": "reply"}, {"since": "../x"}, {"since": 5}])
+@pytest.mark.parametrize(
+    "args", [{"limit": 0}, {"limit": 1000}, {"limit": "many"}, {"kinds": ["spam"]}, {"kinds": "reply"}, {"since": "../x"}, {"since": 5}]
+)
 def test_bad_comment_arguments_are_refused_before_any_request(args):
     http = FakeMastodon()
     refused("comments", args, http)
