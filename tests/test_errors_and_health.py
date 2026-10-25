@@ -201,7 +201,11 @@ def test_delete_status_is_approval_gated_and_declares_no_capability():
 
 
 def test_the_plugin_imports_registers_and_has_its_version():
-    assert marvin_integration_mastodon.__version__ == "0.3.1"
+    import tomllib
+    from pathlib import Path
+
+    project = tomllib.loads((Path(__file__).parents[1] / "pyproject.toml").read_text())["project"]
+    assert marvin_integration_mastodon.__version__ == project["version"]  # the one number, never a stale copy
     assert isinstance(INTEGRATION_REGISTRY["mastodon"], MastodonProvider)
     assert get_provider("mastodon").name == "Mastodon"
 

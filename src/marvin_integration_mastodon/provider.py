@@ -251,6 +251,8 @@ class MastodonProvider(IntegrationProvider):
     category = CATEGORY_DESTINATION
     icon = "🐘"
     logo = "logo.svg"
+    post_limits: ClassVar[dict] = {"max": DEFAULT_MAX_CHARACTERS, "unit": "characters", "links": "clickable"}
+    """A status: 500 characters by default (a server may allow more; posting checks the server's own number), all of it shown."""
 
     guide = "guide.md"
     # A Playbook (0.3, SDK 0.15): how to write a post for Mastodon, a skill folder in the package's data. A workspace adds it from the card
